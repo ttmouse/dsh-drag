@@ -20,10 +20,16 @@
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ttmouse/dsh-drag.git"
+  },
+  "homepage": "https://github.com/ttmouse/dsh-drag",
   "files": [
     "lib/",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "node scripts/build.mjs",

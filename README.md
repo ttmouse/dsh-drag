@@ -39,13 +39,14 @@
 ## 安装
 
 ```sh
-# npm 注册表
-dsh plugin --profile web add dsh-drag
+# 从 GitHub（收录在市场里的那条）
+dsh plugin --profile web add github:ttmouse/dsh-drag
 
 # 或本地开发
 cd ~/.dsh/profiles/web && pnpm add "dsh-drag@link:/path/to/dsh-drag"
 ```
 
+`lib/` 已随仓库提交（`pnpm build` 的产物），所以 GitHub 安装不需要构建授权。
 `dsh.profile.bundles` 里加入 `"dsh-drag"`（`dsh plugin add` 会自动加），重启
 `dsh web` 并硬刷新浏览器。
 
