@@ -1,0 +1,45 @@
+{
+  "name": "dsh-drag",
+  "description": "Drag a conversation from the dsh web sidebar's session list into the transcript area to open it: a shell.overlay drop zone follows the pointer while a native row drag is in flight, and dropping calls sessions.open(sessionId).",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
+    "drag-and-drop",
+    "sidebar",
+    "session",
+    "web"
+  ],
+  "main": "lib/host.js",
+  "exports": {
+    ".": "./lib/host.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/interaction.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "react": "^18.2.0",
+    "jsdom": "^26.0.0"
+  }
+}

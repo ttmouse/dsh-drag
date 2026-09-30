@@ -1,0 +1,6 @@
+# dsh-drag bundle patch: makes the browser half visible to the web shell.
+# The host row id is deployment-local; the package name must match package.json.
+
+- insert:
+    - id: dsh-drag
+      name: 'dsh-drag'
