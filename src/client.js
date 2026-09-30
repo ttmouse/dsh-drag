@@ -14,9 +14,10 @@
  * - The sidebar rows are native HTML5 drag sources already: ui-workspace's
  *   SessionNodeItem sets `dataTransfer.setData('text/plain', node.id)` — the
  *   raw session id — on dragstart.
- * - The drop side is this plugin's document-level dragover/drop pair. Anything
- *   inside the sidebar tree (`[role="tree"]`) is left untouched so the official
- *   row reordering keeps working.
+ * - The drop side is this plugin's document-level dragover/drop pair, taken in
+ *   the capture phase so the composer's own Lexical drop path never pastes the
+ *   bare session id. Anything inside the sidebar tree (`[role="tree"]`) is left
+ *   untouched so the official row reordering keeps working.
  * - The insertion goes through the facade the composer's own pick flow uses:
  *   `conversation.input.for(actx).insertReference(reference, span, …)`, with the
  *   span built from `caretSpan()` (detect coordinates) + `snapshot.draftRev`
@@ -114,6 +115,12 @@ function createDropSurface(deps) {
     if (!summary) return
     dragging = { sessionId, title: summary.displayTitle ?? summary.title ?? sessionId }
     ended = false
+    // The row's own dragstart declares `move` (that drag is the official
+    // reorder gesture). A `copy` dropEffect outside effectAllowed is not a legal
+    // pair — Chrome tolerates it, stricter engines simply refuse the drop — so
+    // widen the allowance here, in the same dragstart, after the row's handler
+    // has put the payload on.
+    if (transfer) transfer.effectAllowed = 'copyMove'
   }
 
   /** The sidebar region: any row the shell owns. Real rows carry no
@@ -129,8 +136,10 @@ function createDropSurface(deps) {
     // The sidebar keeps its own reorder handling: never touch those events.
     if (overSidebar(event)) return
     // Accepting the drop is the whole signal: the pointer picks up the copy
-    // badge, which is the only feedback this plugin adds.
+    // badge, which is the only feedback this plugin adds. The gesture is taken
+    // whole — see the capture-phase note at the listener pair below.
     event.preventDefault()
+    event.stopPropagation()
     if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
   }
 
@@ -138,6 +147,7 @@ function createDropSurface(deps) {
     if (dragging === null || ended) return
     if (overSidebar(event)) return
     event.preventDefault()
+    event.stopPropagation()
     const { sessionId, title } = dragging
     ended = true
     dragging = null
@@ -162,15 +172,23 @@ function createDropSurface(deps) {
     dragging = null
   }
 
+  // `dragover`/`drop` ride the capture phase. The composer is a Lexical editor
+  // whose own drop listener (on the editor root, a descendant) would paste the
+  // `text/plain` payload — the bare session id — into the draft before any
+  // bubble-phase listener runs, so dropping right on the input would leave the
+  // chip preceded by raw id text. Capture reaches document first, and the
+  // accept path stops propagation, so the chip is the only insertion.
+  // `dragstart`/`dragend` stay on bubble: the sidebar row's own handler sets the
+  // payload first, and this listener reads it.
   doc.addEventListener('dragstart', onDragStart)
-  doc.addEventListener('dragover', onDragOver)
-  doc.addEventListener('drop', onDrop)
+  doc.addEventListener('dragover', onDragOver, true)
+  doc.addEventListener('drop', onDrop, true)
   doc.addEventListener('dragend', onDragEnd)
 
   return () => {
     doc.removeEventListener('dragstart', onDragStart)
-    doc.removeEventListener('dragover', onDragOver)
-    doc.removeEventListener('drop', onDrop)
+    doc.removeEventListener('dragover', onDragOver, true)
+    doc.removeEventListener('drop', onDrop, true)
     doc.removeEventListener('dragend', onDragEnd)
   }
 }
@@ -183,8 +201,8 @@ function createDropSurface(deps) {
 const pluginInject = ['slots', 'sessions', 'conversation', 'locale']
 
 /**
- * Browser plugin body: register dictionaries, then wire the dock entry whose
- * inject share closes over the per-session input facade.
+ * Browser plugin body: register the dictionaries on the root fiber, then mount
+ * the document-level drop surface inside the service-gated inject scope.
  * @param ctx - client root context.
  */
 function apply(ctx) {
@@ -195,31 +213,42 @@ function apply(ctx) {
     const { slots, sessions, conversation } = scope
 
     /** Insertion face resolved at drop time against the CURRENT session: the
-     *  composer the user is looking at is the one the chip must land in. */
+     *  composer the user is looking at is the one the chip must land in. Answers
+     *  null rather than throwing — a drop handler has nowhere to report to, and
+     *  `conversation.input.for` throws for a session that resolves no binding. */
     const resolveFace = () => {
-      const current = sessions.list.getSnapshot().current
-      if (current === undefined) return null
-      const actx = sessions.scope(current)
-      if (actx === undefined) return null
-      const input = conversation.input.for(actx)
-      const span = () => {
-        // The shell facade answers the live caret (detect coordinates) and the
-        // hot InputState (draftRev for the span CAS). A collapsed span at the
-        // caret is what insertReference replaces with the chip.
-        const caret = typeof input.caretSpan === 'function' ? input.caretSpan() : { start: 0, end: 0 }
-        const rev = (input.snapshot ?? input.state?.getSnapshot())?.draftRev ?? 0
-        return { start: caret.start, end: caret.end, draftRev: rev }
-      }
-      return {
-        insertSessionReference: (reference, sp) => input.insertReference(reference, sp),
-        notify: (level, text) => input.notify(level, text),
-        captureInsertion: span,
+      try {
+        const current = sessions.list.getSnapshot().current
+        if (current === undefined) return null
+        const actx = sessions.scope(current)
+        if (actx === undefined) return null
+        const input = conversation.input.for(actx)
+        const span = () => {
+          // The shell facade answers the live caret (detect coordinates) and the
+          // hot InputState (draftRev for the span CAS). A collapsed span at the
+          // caret is what insertReference replaces with the chip.
+          const caret = typeof input.caretSpan === 'function' ? input.caretSpan() : { start: 0, end: 0 }
+          const rev = (input.snapshot ?? input.state?.getSnapshot())?.draftRev ?? 0
+          return { start: caret.start, end: caret.end, draftRev: rev }
+        }
+        return {
+          insertSessionReference: (reference, sp) => input.insertReference(reference, sp),
+          notify: (level, text) => input.notify(level, text),
+          captureInsertion: span,
+        }
+      } catch {
+        return null
       }
     }
 
-    // The one document-level drag surface; disposal rides the fiber. The inert
-    // stub keeps Node test harnesses able to apply() without a DOM.
-    ctx.effect(() => createDropSurface({
+    // The one document-level drag surface. `scope.effect`, not `ctx.effect`:
+    // inject() is plugin({inject, apply: callback}), so this callback re-runs
+    // whenever those services are re-provided (a hot-reloaded conversation or
+    // session-controller bundle). Tying the surface to the injected scope
+    // disposes the old listener pair before the new one mounts; tying it to the
+    // root fiber would mount a second surface and insert twice per drop.
+    // The inert stub keeps Node test harnesses able to apply() without a DOM.
+    scope.effect(() => createDropSurface({
       doc: typeof document === 'object' && document !== null ? document : { addEventListener() {}, removeEventListener() {}, dispatchEvent() {} },
       sessions,
       t,
@@ -260,10 +289,10 @@ function apply(ctx) {
 }
 
 /**
- * The dock entry renders nothing: the drag surface is document-level and
- * mounted once from apply(). The registration exists to carry the per-session
- * insertion face (inject share) the surface closes over — dropping while a
- * session's composer is open targets that session's input machine.
+ * The dock entry renders nothing, and nothing consumes its inject share: the
+ * surface resolves the current composer itself at drop time (resolveFace). It is
+ * a leftover of the earlier design and can be deleted outright — it only costs
+ * one null seat in the composer dock.
  */
 function DragDock() {
   return null

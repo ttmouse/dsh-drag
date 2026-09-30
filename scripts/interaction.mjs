@@ -67,6 +67,9 @@ const ctx = {
       throw new Error(`unexpected inject deps: ${deps}`)
     }
     callback({
+      // inject() hands the callback the dependency-gated scope ctx — it owns
+      // the surface mount's lifetime (and its own effect()).
+      effect(fn) { const dispose = fn(); disposers.push(dispose); return dispose },
       slots: {
         inject: (name, produce) => { produce(); return () => {} },
         register: (spec, component) => { registered.push({ spec, component }); return () => {} },
@@ -123,14 +126,26 @@ function fire(type, target, options) {
   return event
 }
 
+// Stands in for the composer's own Lexical drop path: a listener on the inner
+// element. The browser delivers it after document capture, so a session-row
+// gesture the plugin takes must never reach it — otherwise the raw session id
+// text would be pasted into the draft alongside the chip.
+const innerSaw = []
+chat.addEventListener('dragover', () => { innerSaw.push('dragover') })
+chat.addEventListener('drop', () => { innerSaw.push('drop') })
+
 // 1. apply() mounted a working surface: a full gesture lands one chip, and the
 //    mention is the host's canonical form.
-fire('dragstart', rowA, { payload: 'session-a', x: 10, y: 10 })
+const start = fire('dragstart', rowA, { payload: 'session-a', x: 10, y: 10 })
+if (start.dataTransfer.effectAllowed !== 'copyMove') {
+  throw new Error(`the copy drop needs a legal effectAllowed, got ${start.dataTransfer.effectAllowed}`)
+}
 const over = fire('dragover', chat)
 if (over.defaultPrevented !== true) throw new Error('dragover over the chat area must accept the drop')
 if (over.dataTransfer.dropEffect !== 'copy') throw new Error('the accepted drop must claim the copy cursor')
 const drop = fire('drop', chat)
 if (drop.defaultPrevented !== true) throw new Error('drop over the chat area must be handled')
+if (innerSaw.length !== 0) throw new Error(`the composer saw the taken gesture: ${innerSaw.join(',')}`)
 if (inserted.length !== 1) throw new Error(`expected one insertion, got ${inserted.length}`)
 const mention = inserted[0].reference.ref
 const expectedUri = `dsh-session:${Buffer.from(JSON.stringify('session-a')).toString('base64url')}`
@@ -154,9 +169,11 @@ const dropSidebar = fire('drop', rowA, { x: 10, y: 10 })
 if (dropSidebar.defaultPrevented !== false) throw new Error('a sidebar drop must stay official')
 if (inserted.length !== 1) throw new Error('a sidebar drop inserted a chip')
 
-// 4. A non-session payload (a workspace row key) never arms the surface.
+// 4. A non-session payload (a workspace row key) never arms the surface, and
+//    passes through to whoever else is listening.
 fire('dragstart', rowA, { payload: 'workspace:ws-1' })
 if (fire('dragover', chat).defaultPrevented !== false) throw new Error('a workspace drag must not arm the drop')
+if (innerSaw.length !== 1) throw new Error('an unrelated drag must still reach inner listeners')
 
 // 5. A drop after dragend is inert.
 fire('dragstart', rowA, { payload: 'session-a' })

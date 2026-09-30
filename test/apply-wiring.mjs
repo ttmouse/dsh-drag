@@ -39,27 +39,30 @@ async function loadBundle() {
 }
 
 /**
- * A document stub that records listeners per type (so a missing mount is
- * visible) and dispatches events to whatever the plugin installed. It has no
- * createElement/getElementById on purpose: the surface must not touch the DOM
- * beyond its listener pair.
+ * A document stub that records listeners per type and phase (so a missing mount
+ * or a phase regression is visible) and dispatches events to whatever the
+ * plugin installed. It has no createElement/getElementById on purpose: the
+ * surface must not touch the DOM beyond its listener pair.
  */
 function fakeDoc() {
   const listeners = new Map()
+  const key = (type, capture) => `${type}${capture === true ? ':capture' : ''}`
   return {
-    addEventListener(type, fn) {
-      const list = listeners.get(type) ?? []
+    addEventListener(type, fn, capture) {
+      const id = key(type, capture)
+      const list = listeners.get(id) ?? []
       list.push(fn)
-      listeners.set(type, list)
+      listeners.set(id, list)
     },
-    removeEventListener(type, fn) {
-      const list = listeners.get(type) ?? []
+    removeEventListener(type, fn, capture) {
+      const list = listeners.get(key(type, capture)) ?? []
       const at = list.indexOf(fn)
       if (at >= 0) list.splice(at, 1)
     },
-    emit(type, event) {
-      for (const fn of [...(listeners.get(type) ?? [])]) fn(event)
+    emit(type, event, capture = false) {
+      for (const fn of [...(listeners.get(key(type, capture)) ?? [])]) fn(event)
     },
+    phases: () => [...listeners.keys()].sort(),
     count: () => [...listeners.values()].reduce((total, list) => total + list.length, 0),
   }
 }
@@ -73,7 +76,7 @@ const sidebarTarget = { closest: (selector) => (selector === '[role="tree"]' ? {
 function dragStartEvent(payload) {
   return {
     target: chatTarget,
-    dataTransfer: { effectAllowed: '', getData: (type) => (type === 'text/plain' ? payload : '') },
+    dataTransfer: { effectAllowed: 'move', getData: (type) => (type === 'text/plain' ? payload : '') },
   }
 }
 
@@ -82,12 +85,20 @@ function dragOverEvent(target) {
     target,
     dataTransfer: { dropEffect: 'none' },
     defaultPrevented: false,
+    propagationStopped: false,
     preventDefault() { this.defaultPrevented = true },
+    stopPropagation() { this.propagationStopped = true },
   }
 }
 
 function dropEvent(target) {
-  return { target, defaultPrevented: false, preventDefault() { this.defaultPrevented = true } }
+  return {
+    target,
+    defaultPrevented: false,
+    propagationStopped: false,
+    preventDefault() { this.defaultPrevented = true },
+    stopPropagation() { this.propagationStopped = true },
+  }
 }
 
 /** The host's canonical mention, encoded with Node's own base64url encoder. */
@@ -100,7 +111,7 @@ function hostMention(sessionId, label) {
  * Boot the plugin against a fake host: returns the fake document, everything
  * the insertion path observed, and the fiber disposers apply() registered.
  */
-function boot({ currentSessionId = 'session-current', noSession = false, refuseInsert = false } = {}) {
+function boot({ currentSessionId = 'session-current', noSession = false, refuseInsert = false, throwOnFor = false } = {}) {
   const doc = fakeDoc()
   globalThis.document = doc
   /** What `sessions.list.current` answers: an id, or nothing on stage at all. */
@@ -110,7 +121,8 @@ function boot({ currentSessionId = 'session-current', noSession = false, refuseI
   const notices = []
   const dictionaries = []
   const registered = []
-  const disposers = []
+  const rootDisposers = []
+  const scopeDisposers = []
 
   const shell = {
     caretSpan: () => ({ start: 7, end: 7 }),
@@ -135,6 +147,7 @@ function boot({ currentSessionId = 'session-current', noSession = false, refuseI
     input: {
       for: (scope) => {
         assert.equal(scope, actx, 'the insertion must resolve the CURRENT session scope')
+        if (throwOnFor) throw new Error('conversation.input: session resolved no binding')
         return shell
       },
     },
@@ -144,7 +157,7 @@ function boot({ currentSessionId = 'session-current', noSession = false, refuseI
     effect(fn, label) {
       assert.equal(typeof label, 'string')
       const dispose = fn()
-      if (typeof dispose === 'function') disposers.push(dispose)
+      if (typeof dispose === 'function') rootDisposers.push(dispose)
       return dispose
     },
     locale: {
@@ -153,7 +166,15 @@ function boot({ currentSessionId = 'session-current', noSession = false, refuseI
     },
     inject(deps, callback) {
       assert.deepEqual(deps, ['slots', 'sessions', 'conversation'])
+      // inject() is plugin({inject, apply}), so the callback's argument is the
+      // dependency-gated scope ctx — a ctx with its own effect().
       callback({
+        effect(fn, label) {
+          assert.equal(typeof label, 'string')
+          const dispose = fn()
+          if (typeof dispose === 'function') scopeDisposers.push(dispose)
+          return dispose
+        },
         slots: {
           inject: (name, produce) => { registered.push(name); produce() },
           register: (spec, component) => { registered.push({ spec, component }); return () => {} },
@@ -164,12 +185,12 @@ function boot({ currentSessionId = 'session-current', noSession = false, refuseI
     },
   }
 
-  return { doc, ctx, inserted, notices, dictionaries, registered, disposers }
+  return { doc, ctx, inserted, notices, dictionaries, registered, rootDisposers, scopeDisposers }
 }
 
 async function main() {
   const plugin = await loadBundle()
-  const { doc, ctx, inserted, notices, dictionaries, registered, disposers } = boot()
+  const { doc, ctx, inserted, notices, dictionaries, registered, rootDisposers, scopeDisposers } = boot()
 
   // ── apply() itself must mount the surface; nothing else is exported to do it ──
   plugin.apply(ctx)
@@ -182,17 +203,28 @@ async function main() {
     4,
     'apply() must install the four document drag listeners (this is what silently did not happen in 0.1.0)',
   )
+  assert.deepEqual(
+    doc.phases(),
+    ['dragend', 'dragover:capture', 'dragstart', 'drop:capture'],
+    'dragover/drop must be capture-phase so the composer never sees them',
+  )
+  assert.equal(rootDisposers.length, 1, 'only the dictionary registration rides the root fiber')
+  assert.equal(scopeDisposers.length, 1, 'the surface must ride the inject scope, so re-injection cannot double-mount it')
 
   // ── one whole gesture, driven only at the document listeners apply() installed ──
-  doc.emit('dragstart', dragStartEvent('session-a'))
+  const start = dragStartEvent('session-a')
+  doc.emit('dragstart', start)
+  assert.equal(start.dataTransfer.effectAllowed, 'copyMove', 'the copy drop needs a legal effectAllowed')
   const over = dragOverEvent(chatTarget)
-  doc.emit('dragover', over)
+  doc.emit('dragover', over, true)
   assert.equal(over.defaultPrevented, true, 'dragover over the chat area must allow the drop')
   assert.equal(over.dataTransfer.dropEffect, 'copy', 'the copy badge is the whole affordance')
+  assert.equal(over.propagationStopped, true, 'the taken gesture must not reach the composer')
 
   const drop = dropEvent(chatTarget)
-  doc.emit('drop', drop)
+  doc.emit('drop', drop, true)
   assert.equal(drop.defaultPrevented, true)
+  assert.equal(drop.propagationStopped, true)
   assert.deepEqual(notices, [])
   assert.deepEqual(inserted, [{
     reference: {
@@ -208,33 +240,38 @@ async function main() {
   // ── the sidebar keeps its own reorder handling ──
   doc.emit('dragstart', dragStartEvent('session-a'))
   const overSidebar = dragOverEvent(sidebarTarget)
-  doc.emit('dragover', overSidebar)
+  doc.emit('dragover', overSidebar, true)
   assert.equal(overSidebar.defaultPrevented, false, 'the sidebar must keep its own dragover handling')
+  assert.equal(overSidebar.propagationStopped, false, 'the sidebar gesture must reach the row handlers')
   assert.equal(overSidebar.dataTransfer.dropEffect, 'none', 'no drop effect is claimed over the sidebar')
   const dropSidebar = dropEvent(sidebarTarget)
-  doc.emit('drop', dropSidebar)
+  doc.emit('drop', dropSidebar, true)
   assert.equal(dropSidebar.defaultPrevented, false)
+  assert.equal(dropSidebar.propagationStopped, false)
   assert.equal(inserted.length, 1, 'a sidebar drop must not insert')
 
   // ── workspace rows and other payloads stay inert ──
   for (const payload of ['workspace:ws-1', '/Users/douba/notes.md', '', 'session-gone']) {
-    doc.emit('dragstart', dragStartEvent(payload))
+    const inertStart = dragStartEvent(payload)
+    doc.emit('dragstart', inertStart)
+    assert.equal(inertStart.dataTransfer.effectAllowed, 'move', `payload ${JSON.stringify(payload)} must not be touched`)
     const inertOver = dragOverEvent(chatTarget)
-    doc.emit('dragover', inertOver)
+    doc.emit('dragover', inertOver, true)
     assert.equal(inertOver.defaultPrevented, false, `payload ${JSON.stringify(payload)} must not arm the drop`)
-    doc.emit('drop', dropEvent(chatTarget))
+    assert.equal(inertOver.propagationStopped, false, `payload ${JSON.stringify(payload)} must pass through untouched`)
+    doc.emit('drop', dropEvent(chatTarget), true)
     assert.equal(inserted.length, 1, `payload ${JSON.stringify(payload)} must not insert`)
   }
 
   // ── a drag that ended is over: no drop may follow it ──
   doc.emit('dragstart', dragStartEvent('session-a'))
   doc.emit('dragend', { target: chatTarget })
-  doc.emit('drop', dropEvent(chatTarget))
+  doc.emit('drop', dropEvent(chatTarget), true)
   assert.equal(inserted.length, 1, 'drop after dragend must be inert')
 
   // ── the current session is never referenced by itself ──
   doc.emit('dragstart', dragStartEvent('session-current'))
-  doc.emit('drop', dropEvent(chatTarget))
+  doc.emit('drop', dropEvent(chatTarget), true)
   assert.deepEqual(notices, [{ level: 'info', text: 'dshDrag.info.self' }])
   assert.equal(inserted.length, 1)
 
@@ -243,7 +280,7 @@ async function main() {
     const refused = boot({ refuseInsert: true })
     plugin.apply(refused.ctx)
     refused.doc.emit('dragstart', dragStartEvent('session-a'))
-    refused.doc.emit('drop', dropEvent(chatTarget))
+    refused.doc.emit('drop', dropEvent(chatTarget), true)
     assert.equal(refused.inserted.length, 1, 'the insertion is attempted')
     assert.deepEqual(refused.notices, [{ level: 'error', text: 'dshDrag.error.insert' }])
   }
@@ -253,14 +290,26 @@ async function main() {
     const blank = boot({ noSession: true })
     plugin.apply(blank.ctx)
     blank.doc.emit('dragstart', dragStartEvent('session-a'))
-    blank.doc.emit('drop', dropEvent(chatTarget))
+    blank.doc.emit('drop', dropEvent(chatTarget), true)
     assert.deepEqual(blank.inserted, [])
     assert.deepEqual(blank.notices, [])
   }
 
+  // ── a host that throws out of conversation.input.for must not escape a drop ──
+  {
+    const hostile = boot({ throwOnFor: true })
+    plugin.apply(hostile.ctx)
+    hostile.doc.emit('dragstart', dragStartEvent('session-a'))
+    hostile.doc.emit('drop', dropEvent(chatTarget), true)
+    assert.deepEqual(hostile.inserted, [], 'a throwing resolveFace inserts nothing')
+    assert.deepEqual(hostile.notices, [], 'and reports nothing — there is no composer to report to')
+  }
+
   // ── disposal takes the listeners with it ──
-  for (const dispose of disposers) dispose()
-  assert.equal(doc.count(), 0, 'disposal must remove every document listener')
+  for (const dispose of scopeDisposers) dispose()
+  assert.equal(doc.count(), 0, 'scope disposal must remove every document listener')
+  for (const dispose of rootDisposers) dispose()
+  assert.equal(doc.count(), 0, 'and the root effect never owned any')
 
   console.log(`dsh-drag apply() wiring: passed (${BUNDLE})`)
 }

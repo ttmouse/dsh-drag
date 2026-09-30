@@ -12,6 +12,13 @@
 - 放下走的是编辑器自己的引用通道：`conversation.input.for(actx).insertReference`
   —— 与输入框内 `@`/`/` 挑选流程同一条 span-CAS 路径，插进去的是真正的 chip
   节点，而不是一段文本。
+- `dragover`/`drop` 挂在 **document 捕获阶段**并 `stopPropagation()`：输入框是
+  Lexical 编辑器，它在编辑器根节点上自己监听 `drop`，会把 `text/plain` 载荷
+  （也就是裸 session id）当文本贴进草稿——冒泡阶段拦已经太晚，捕获阶段才行。
+  `dragstart`/`dragend` 仍走冒泡：会话行的 payload 由它自己的 handler 先写。
+- `dragstart` 里把 `effectAllowed` 从行自带的 `move` 放宽成 `copyMove`：声明
+  `move` 的拖拽配 `dropEffect = 'copy'` 不是合法组合，Chrome 宽容、严格的引擎会
+  直接拒绝这次放下。
 - 拖回侧边栏（`[role="tree"]` 里的任何行）**永远不拦截**：官方的行内重排序行为
   原样保留。
 
@@ -51,11 +58,13 @@ pnpm test    # test/smoke.mjs + test/apply-wiring.mjs + scripts/interaction.mjs
 ```
 
 - `test/apply-wiring.mjs`：**只经 `apply(ctx)`** 驱动整条链路（假 document +
-  假宿主服务）：断言四个 document 监听真的被装上、一次完整拖放手势能插 chip、
-  span 取的是 `caretSpan()` + `snapshot.draftRev`、侧边栏与工作区行一律放行、
-  dispose 撤干净。0.1.0 的 bug 是 `apply()` 压根没挂 surface（模块导出的
-  `createDropSurface` 自己是对的，老测试直接调它所以全绿）——这个文件就是为
-  它存在的回归闸门：把 `src/client.js` 回滚到修复前，只有它会红。
+  假宿主服务）：断言四个 document 监听真的被装上、`dragover`/`drop` 的**相位**是
+  捕获、接受时确实 `stopPropagation`、`effectAllowed` 被放宽、一次完整拖放手势能
+  插 chip、span 取的是 `caretSpan()` + `snapshot.draftRev`、侧边栏与工作区行一律
+  放行、surface 挂在 inject scope 上（不是 root fiber）、dispose 撤干净。0.1.0 的
+  bug 是 `apply()` 压根没挂 surface（模块导出的 `createDropSurface` 自己是对的，
+  老测试直接调它所以全绿）——这个文件就是为它存在的回归闸门：把 `src/client.js`
+  回滚到修复前，只有它会红；把上面任一条改坏也会红。
 - `test/smoke.mjs`：假 doc 手势驱动 `createDropSurface` 全部分支（mention 编码
   对齐宿主 `dsh-session-reference` 的规范形、侧边栏放行、dragend 之后 drop 失效、
   自引用提示、插入拒绝提示、apply() 的 dock 槽与 inject 面、bundle 形状）。

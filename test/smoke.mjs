@@ -72,12 +72,22 @@ function dragOverEvent(target, clientX = 500, clientY = 300) {
     clientY,
     dataTransfer: { dropEffect: 'none' },
     defaultPrevented: false,
+    propagationStopped: false,
     preventDefault() { this.defaultPrevented = true },
+    stopPropagation() { this.propagationStopped = true },
   }
 }
 
 function dropEvent(target) {
-  return { target, clientX: 500, clientY: 300, defaultPrevented: false, preventDefault() { this.defaultPrevented = true } }
+  return {
+    target,
+    clientX: 500,
+    clientY: 300,
+    defaultPrevented: false,
+    propagationStopped: false,
+    preventDefault() { this.defaultPrevented = true },
+    stopPropagation() { this.propagationStopped = true },
+  }
 }
 
 /** One session list snapshot with the given rows. */
@@ -260,6 +270,9 @@ async function main() {
       inject: (deps, callback) => {
         assert.deepEqual(deps, ['slots', 'sessions', 'conversation'])
         callback({
+          // inject() hands the callback the dependency-gated scope ctx, which
+          // owns the surface mount's lifetime.
+          effect: (fn) => fn(),
           slots: {
             inject: (name, produce) => { slotInjects.push(name); produce() },
             register: (spec, component) => { registered.push({ spec, component }); return () => {} },
