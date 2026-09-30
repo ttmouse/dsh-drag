@@ -27,7 +27,7 @@
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node scripts/interaction.mjs"
+    "test": "node test/smoke.mjs && node scripts/interaction.mjs"
   },
   "dsh": {
     "bundle": {

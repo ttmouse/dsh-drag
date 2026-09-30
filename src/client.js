@@ -1,172 +1,226 @@
 /**
  * dsh-drag — browser half.
  *
- * Drag a session row from the sidebar's session list into the transcript
- * (chat history) area to open it.
+ * Drag a conversation row from the sidebar's session list into the chat
+ * transcript area: a floating hint follows the pointer and, on drop, the
+ * session reference (`@[label](dsh-session:…)` mention) is inserted into the
+ * target session's composer draft as a reference chip.
  *
- * The sidebar rows are already native HTML5 drag sources: ui-workspace's
- * SessionNodeItem sets `dataTransfer.setData('text/plain', node.id)` on
- * dragstart (verified in the 0.1.5-rc.2 bundle). This plugin adds the missing
- * drop side: a `shell.overlay` entry (the layout's frame-wide, click-through
- * floating layer) that listens for `dragover` on the document, highlights the
- * conversation column while the payload is a bare session id, and on `drop`
- * calls `ctx.sessions.open(sessionId)` — the same call the sidebar row's
- * click makes. Plain sessions only: subagent-addressed ids never appear in
- * the drag payload, and ids absent from the list snapshot are ignored.
+ * Why this shape:
+ * - The sidebar rows are native HTML5 drag sources already: ui-workspace's
+ *   SessionNodeItem puts the raw session id on the payload
+ *   (`dataTransfer.setData('text/plain', node.id)`, verified in 0.1.5-rc.2).
+ * - The drop side is this plugin's document-level dragover/drop pair. Dropping
+ *   back onto the sidebar (any `[data-row-key]` target) is deliberately NOT
+ *   prevented so the official reorder behavior keeps working.
+ * - The insertion goes through `conversation.input.for(actx).insertReference`,
+ *   the same span-CAS'd chip path the composer's own pick flow uses; the span
+ *   (caret + draftRev) is captured at drop time via the session scope's
+ *   `inputActions.captureInsertion()`.
+ *
+ * Row identity: dragstart records the payload only when its target carries
+ * `data-row-key="session:<sessionId>"` — workspace rows (`workspace:<id>`)
+ * and every other drag source stay inert.
  */
 
-/** The overlay entry id in the `shell.overlay` list slot. */
-const PLUGIN_ID = 'dsh-drag'
+/** Locale namespace owned by this plugin. */
+const NS = 'dshDrag'
 
-/** Marker attribute on the active conversation scrollport (ui-conversation). */
-const SCROLLPORT_SELECTOR = '[data-conversation-scroll]'
+/** Dictionary key set (the source of truth for both locales). */
+const KEYS = ['hint.reference', 'info.self', 'error.insert']
 
-/** Drop-zone visual: a dashed accent border inside the transcript area. */
-const CSS = [
-  '[data-dsh-drag-active] {',
-  '  position: fixed;',
-  '  z-index: 30;',
-  '  pointer-events: none;',
-  '  border: 2px dashed var(--ds-brand, #4d6bfe);',
-  '  border-radius: 12px;',
-  '  background: color-mix(in srgb, var(--ds-brand, #4d6bfe) 8%, transparent);',
-  '  transition: opacity 120ms ease;',
-  '  opacity: 1;',
-  '}',
-  '[data-dsh-drag-active="false"] { opacity: 0; }',
-].join('\n')
-
-/** Locale copy for the overlay's accessible label. */
-const LABELS = {
-  en: 'Drop to open this conversation',
-  zh: '松开以打开该会话',
+const DICTIONARIES = {
+  zh: {
+    'hint.reference': '松开以引用会话「{title}」',
+    'info.self': '当前会话不需要引用自己',
+    'error.insert': '会话引用插入失败',
+  },
+  en: {
+    'hint.reference': 'Drop to reference “{title}”',
+    'info.self': 'The current session does not need to reference itself',
+    'error.insert': 'Failed to insert the session reference',
+  },
 }
 
-/** True when the payload is a bare session id worth opening. Sidebar drags
- *  put a raw session id on the payload; file paths and prose never qualify. */
+/** Canonical `dsh-session:` URI (host form: base64url(JSON.stringify(id))). */
+function encodeSessionUri(sessionId) {
+  const bytes = new TextEncoder().encode(JSON.stringify(sessionId))
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return `dsh-session:${btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}`
+}
+
+/** Escape a mention label: backslash and closing bracket. */
+function escapeLabel(label) {
+  return label.replace(/[\\\]]/gu, (match) => `\\${match}`)
+}
+
+/** Host-neutral Markdown mention carrying the canonical URI. */
+function formatSessionMention(sessionId, label) {
+  return `@[${escapeLabel(label ?? sessionId)}](${encodeSessionUri(sessionId)})`
+}
+
+/** True when the payload is a bare session id (what sidebar rows put there). */
 function isPlausibleSessionId(text) {
-  return typeof text === 'string'
-    && /^[A-Za-z0-9_-]{1,128}$/.test(text)
+  return typeof text === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(text)
+}
+
+/** Read `data-row-key` off the event target's ancestor row, if any. */
+function rowKeyOf(target) {
+  return target && typeof target.closest === 'function'
+    ? target.closest('[data-row-key]')?.getAttribute('data-row-key') ?? null
+    : null
 }
 
 /**
- * Resolve the transcript scrollport's viewport rect, or null when the
- * conversation view is not mounted (plugin page, hero-only views).
+ * The document-level drop surface: tracks the active sidebar session drag,
+ * shows a floating hint while over the chat area, and inserts the reference
+ * on drop. Pure DOM + callbacks so tests can drive it without a browser.
+ * @param deps - doc, sessions, t, currentSessionId, inputActions,
+ *   insertSessionReference, notify, onHint.
+ * @returns disposer removing every listener.
  */
-function scrollportRect() {
-  const el = document.querySelector(SCROLLPORT_SELECTOR)
-  return el ? el.getBoundingClientRect() : null
+function createDropSurface(deps) {
+  const { doc, sessions, t, currentSessionId, inputActions, insertSessionReference, notify, onHint } = deps
+
+  /** The drag in flight: `{ sessionId, title } | null`. */
+  let dragging = null
+  /** A drag that ended can never drop (dragend always precedes a later drop). */
+  let ended = true
+
+  const hideHint = () => { onHint(null) }
+
+  const onDragStart = (event) => {
+    const rowKey = rowKeyOf(event.target)
+    const sessionId = rowKey !== null && rowKey.startsWith('session:')
+      ? rowKey.slice('session:'.length)
+      : null
+    if (sessionId === null || !isPlausibleSessionId(sessionId)) return
+    const summary = sessions.list.getSnapshot().byId[sessionId]
+    if (!summary) return
+    dragging = { sessionId, title: summary.displayTitle ?? summary.title ?? sessionId }
+    ended = false
+  }
+
+  const overSidebar = (event) => rowKeyOf(event.target) !== null
+
+  const onDragOver = (event) => {
+    if (dragging === null || ended) return
+    // The sidebar keeps its own reorder handling: never touch those events.
+    if (overSidebar(event)) {
+      hideHint()
+      return
+    }
+    event.preventDefault()
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+    onHint({ text: t('hint.reference', { title: dragging.title }), x: event.clientX + 14, y: event.clientY + 18 })
+  }
+
+  const onDrop = (event) => {
+    if (dragging === null || ended) return
+    if (overSidebar(event)) return
+    event.preventDefault()
+    hideHint()
+    const { sessionId, title } = dragging
+    ended = true
+    dragging = null
+    if (sessionId === currentSessionId) {
+      notify('info', t('info.self'))
+      return
+    }
+    const mention = formatSessionMention(sessionId, title)
+    const span = inputActions.captureInsertion()
+    const inserted = insertSessionReference({
+      source: 'reference',
+      ref: mention,
+      label: title,
+      appearance: 'session',
+      clipboardText: mention,
+    }, span)
+    if (!inserted) notify('error', t('error.insert'))
+  }
+
+  const onDragEnd = () => {
+    ended = true
+    dragging = null
+    hideHint()
+  }
+
+  doc.addEventListener('dragstart', onDragStart)
+  doc.addEventListener('dragover', onDragOver)
+  doc.addEventListener('drop', onDrop)
+  doc.addEventListener('dragend', onDragEnd)
+
+  return () => {
+    doc.removeEventListener('dragstart', onDragStart)
+    doc.removeEventListener('dragover', onDragOver)
+    doc.removeEventListener('drop', onDrop)
+    doc.removeEventListener('dragend', onDragEnd)
+  }
 }
 
+/**
+ * Required services (cordis fiber inject): the slot registry, the sessions
+ * controller (list snapshot + scope resolution), the conversation service
+ * (per-session input facade), and the locale service.
+ */
+const pluginInject = ['slots', 'sessions', 'conversation', 'locale']
+
+/**
+ * Browser plugin body: register dictionaries, then wire the dock entry whose
+ * inject share closes over the per-session input facade.
+ * @param ctx - client root context.
+ */
 function apply(ctx) {
-  const label = () => (LABELS[ctx.locale?.current] ?? LABELS.en)
+  ctx.effect(() => ctx.locale.register(NS, DICTIONARIES), 'dsh-drag: dictionaries')
+  const t = ctx.locale.bind(NS)
 
-  ctx.effect(() => {
-    const style = document.createElement('style')
-    style.id = 'dsh-drag-style'
-    style.textContent = CSS
-    document.head.appendChild(style)
-    return () => { style.remove() }
-  }, 'dsh-drag: style')
+  ctx.inject(['slots', 'sessions', 'conversation'], (scope) => {
+    const { slots, sessions, conversation } = scope
 
-  ctx.effect(() => {
-    const zone = document.createElement('div')
-    zone.id = 'dsh-drag-zone'
-    zone.setAttribute('data-dsh-drag-active', 'false')
-    zone.setAttribute('role', 'region')
-    zone.setAttribute('aria-label', label())
-    document.body.appendChild(zone)
-
-    let visible = false
-    let overTranscript = false
-
-    const paint = () => {
-      const rect = scrollportRect()
-      if (!visible || !rect) {
-        zone.setAttribute('data-dsh-drag-active', 'false')
-        return
-      }
-      zone.style.left = `${Math.round(rect.left + 4)}px`
-      zone.style.top = `${Math.round(rect.top + 4)}px`
-      zone.style.width = `${Math.max(0, Math.round(rect.width - 8))}px`
-      zone.style.height = `${Math.max(0, Math.round(rect.height - 8))}px`
-      zone.setAttribute('data-dsh-drag-active', 'true')
-    }
-
-    const show = () => {
-      if (!visible) {
-        visible = true
-        overTranscript = false
-        paint()
-      }
-    }
-
-    const hide = () => {
-      visible = false
-      overTranscript = false
-      zone.setAttribute('data-dsh-drag-active', 'false')
-    }
-
-    const payloadOf = (event) => {
-      const text = event.dataTransfer?.getData('text/plain') ?? ''
-      return isPlausibleSessionId(text) ? text : null
-    }
-
-    const onDragOver = (event) => {
-      if (visible) event.preventDefault()
-    }
-
-    const onDocumentDragOver = (event) => {
-      const sessionId = payloadOf(event)
-      if (!sessionId) return
-      show()
-      // allow-drop: the default action must be prevented for drop to fire.
-      event.preventDefault()
-      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
-      const rect = scrollportRect()
-      overTranscript = rect !== null
-        && event.clientX >= rect.left && event.clientX <= rect.right
-        && event.clientY >= rect.top && event.clientY <= rect.bottom
-      paint()
-    }
-
-    const onDrop = (event) => {
-      const sessionId = payloadOf(event)
-      if (!sessionId) return
-      event.preventDefault()
-      const rect = scrollportRect()
-      const inside = rect !== null
-        && event.clientX >= rect.left && event.clientX <= rect.right
-        && event.clientY >= rect.top && event.clientY <= rect.bottom
-      hide()
-      if (!inside) return
-      // Same write the sidebar row's click performs; unknown ids fail loud
-      // inside the controller and must not touch the current selection.
-      const known = ctx.sessions.list.getSnapshot().byId[sessionId]
-      if (!known) return
-      ctx.sessions.open(sessionId)
-    }
-
-    const onDragEnd = () => { hide() }
-
-    document.addEventListener('dragover', onDocumentDragOver, true)
-    document.addEventListener('drop', onDrop, true)
-    document.addEventListener('dragend', onDragEnd, true)
-    document.addEventListener('dragleave', onDragEnd, true)
-    window.addEventListener('dragover', onDragOver)
-
-    return () => {
-      document.removeEventListener('dragover', onDocumentDragOver, true)
-      document.removeEventListener('drop', onDrop, true)
-      document.removeEventListener('dragend', onDragEnd, true)
-      document.removeEventListener('dragleave', onDragEnd, true)
-      window.removeEventListener('dragover', onDragOver)
-      zone.remove()
-    }
-  }, 'dsh-drag: overlay drop zone')
+    slots.inject('conversation.input.dock', () => slots.register({
+      name: 'conversation.input.dock',
+      id: 'dsh-drag',
+      order: 40,
+      registrant: 'dsh-drag',
+      locale: NS,
+      inject: (sessionId) => {
+        const actx = sessions.scope(sessionId)
+        if (actx === undefined) {
+          return {
+            targetSessionId: sessionId,
+            sessions,
+            t,
+            insertSessionReference: () => false,
+            notify: () => {},
+          }
+        }
+        const input = conversation.input.for(actx)
+        return {
+          targetSessionId: sessionId,
+          sessions,
+          t,
+          insertSessionReference: (reference, span) => input.insertReference(reference, span),
+          notify: (level, text) => input.notify(level, text),
+        }
+      },
+    }, DragDock))
+  })
 }
 
-/** `slots` for the overlay seat; `sessions` for list + open; `locale` optional. */
-export const inject = ['slots', 'sessions', 'locale']
+/**
+ * The dock entry renders nothing: the drag surface is document-level and
+ * mounted once from apply(). The registration exists to carry the per-session
+ * insertion face (inject share) the surface closes over — dropping while a
+ * session's composer is open targets that session's input machine.
+ */
+function DragDock() {
+  return null
+}
 
-export { apply }
+/** Internals exposed for tests and debugging. */
+const __internals = {
+  createDropSurface,
+  formatSessionMention,
+  encodeSessionUri,
+}
