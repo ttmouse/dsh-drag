@@ -8,6 +8,11 @@
  * goes through `apply(ctx)`: it installs a fake document, calls the plugin
  * body, and then drives a whole drag gesture at what the plugin itself wired.
  *
+ * The fake document carries nothing but listener bookkeeping: this plugin draws
+ * no UI of its own (the browser's drag image and copy cursor are the whole
+ * feedback), so any element creation or lookup from the surface is a failure,
+ * not a silent extra overlay.
+ *
  * It also pins the two host contracts the insertion depends on, so a drift in
  * either fails here instead of silently in the browser:
  * - the dragged session id arrives on the `text/plain` payload (ui-workspace's
@@ -18,13 +23,11 @@
  * Run: node test/apply-wiring.mjs [bundle.js]
  */
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const BUNDLE = process.argv[2] ?? join(here, '..', 'lib', 'client.js')
-const HINT_ID = 'dsh-drag-hint'
 
 /** Load the shipped bundle and return the module its loader factory produced. */
 async function loadBundle() {
@@ -35,42 +38,15 @@ async function loadBundle() {
   return captured.factory(() => { throw new Error('the browser half requires no modules') })
 }
 
-/** One fake element: enough surface for the hint layer. */
-function fakeElement(doc, tag) {
-  return {
-    tagName: tag,
-    id: '',
-    style: {},
-    dataset: {},
-    attributes: {},
-    textContent: '',
-    removed: false,
-    setAttribute(name, value) { this.attributes[name] = value },
-    getAttribute(name) { return this.attributes[name] ?? null },
-    remove() {
-      this.removed = true
-      if (this.id !== '' && doc.byId.get(this.id) === this) doc.byId.delete(this.id)
-    },
-  }
-}
-
 /**
- * A document stub: records listeners per type (so a missing mount is visible),
- * keeps appended elements addressable by id (the hint layer's own lookup), and
- * dispatches events to whatever the plugin installed.
+ * A document stub that records listeners per type (so a missing mount is
+ * visible) and dispatches events to whatever the plugin installed. It has no
+ * createElement/getElementById on purpose: the surface must not touch the DOM
+ * beyond its listener pair.
  */
 function fakeDoc() {
   const listeners = new Map()
-  const byId = new Map()
-  const doc = {
-    byId,
-    createElement: (tag) => fakeElement(doc, tag),
-    getElementById: (id) => byId.get(id) ?? null,
-    body: {
-      appendChild(el) {
-        if (el.id !== '') byId.set(el.id, el)
-      },
-    },
+  return {
     addEventListener(type, fn) {
       const list = listeners.get(type) ?? []
       list.push(fn)
@@ -86,24 +62,24 @@ function fakeDoc() {
     },
     count: () => [...listeners.values()].reduce((total, list) => total + list.length, 0),
   }
-  return doc
 }
 
 /** An event target outside the sidebar. */
 const chatTarget = { closest: () => null }
 
-/** A session row in the native sidebar tree. */
+/** A row inside the native sidebar tree. */
 const sidebarTarget = { closest: (selector) => (selector === '[role="tree"]' ? {} : null) }
 
 function dragStartEvent(payload) {
-  return { target: chatTarget, dataTransfer: { effectAllowed: '', getData: (type) => (type === 'text/plain' ? payload : '') } }
+  return {
+    target: chatTarget,
+    dataTransfer: { effectAllowed: '', getData: (type) => (type === 'text/plain' ? payload : '') },
+  }
 }
 
-function dragOverEvent(target, clientX = 400, clientY = 250) {
+function dragOverEvent(target) {
   return {
     target,
-    clientX,
-    clientY,
     dataTransfer: { dropEffect: 'none' },
     defaultPrevented: false,
     preventDefault() { this.defaultPrevented = true },
@@ -111,7 +87,7 @@ function dragOverEvent(target, clientX = 400, clientY = 250) {
 }
 
 function dropEvent(target) {
-  return { target, clientX: 400, clientY: 250, defaultPrevented: false, preventDefault() { this.defaultPrevented = true } }
+  return { target, defaultPrevented: false, preventDefault() { this.defaultPrevented = true } }
 }
 
 /** The host's canonical mention, encoded with Node's own base64url encoder. */
@@ -124,7 +100,7 @@ function hostMention(sessionId, label) {
  * Boot the plugin against a fake host: returns the fake document, everything
  * the insertion path observed, and the fiber disposers apply() registered.
  */
-function boot({ currentSessionId = 'session-current', noSession = false } = {}) {
+function boot({ currentSessionId = 'session-current', noSession = false, refuseInsert = false } = {}) {
   const doc = fakeDoc()
   globalThis.document = doc
   /** What `sessions.list.current` answers: an id, or nothing on stage at all. */
@@ -139,7 +115,7 @@ function boot({ currentSessionId = 'session-current', noSession = false } = {}) 
   const shell = {
     caretSpan: () => ({ start: 7, end: 7 }),
     snapshot: { draft: '', draftRev: 12 },
-    insertReference: (reference, span) => { inserted.push({ reference, span }); return true },
+    insertReference: (reference, span) => { inserted.push({ reference, span }); return !refuseInsert },
     notify: (level, text) => { notices.push({ level, text }) },
   }
   const actx = { tag: 'session-current' }
@@ -173,7 +149,7 @@ function boot({ currentSessionId = 'session-current', noSession = false } = {}) 
     },
     locale: {
       register: (ns, dicts) => { dictionaries.push({ ns, dicts }); return () => {} },
-      bind: (ns) => (key, params) => (params === undefined ? `${ns}.${key}` : `${ns}.${key}(${params.title})`),
+      bind: (ns) => (key) => `${ns}.${key}`,
     },
     inject(deps, callback) {
       assert.deepEqual(deps, ['slots', 'sessions', 'conversation'])
@@ -206,23 +182,17 @@ async function main() {
     4,
     'apply() must install the four document drag listeners (this is what silently did not happen in 0.1.0)',
   )
+
   // ── one whole gesture, driven only at the document listeners apply() installed ──
   doc.emit('dragstart', dragStartEvent('session-a'))
   const over = dragOverEvent(chatTarget)
   doc.emit('dragover', over)
   assert.equal(over.defaultPrevented, true, 'dragover over the chat area must allow the drop')
-  assert.equal(over.dataTransfer.dropEffect, 'copy')
-
-  const hint = doc.getElementById(HINT_ID)
-  assert.ok(hint !== null && hint.removed === false, 'the hint element must be mounted while dragging')
-  assert.equal(hint.textContent, 'dshDrag.hint.reference(A 会话)')
-  assert.equal(hint.style.left, '414px')
-  assert.equal(hint.style.top, '268px')
+  assert.equal(over.dataTransfer.dropEffect, 'copy', 'the copy badge is the whole affordance')
 
   const drop = dropEvent(chatTarget)
   doc.emit('drop', drop)
   assert.equal(drop.defaultPrevented, true)
-  assert.equal(doc.getElementById(HINT_ID), null, 'the hint clears on drop')
   assert.deepEqual(notices, [])
   assert.deepEqual(inserted, [{
     reference: {
@@ -240,7 +210,7 @@ async function main() {
   const overSidebar = dragOverEvent(sidebarTarget)
   doc.emit('dragover', overSidebar)
   assert.equal(overSidebar.defaultPrevented, false, 'the sidebar must keep its own dragover handling')
-  assert.equal(doc.getElementById(HINT_ID), null, 'no chat hint over the sidebar')
+  assert.equal(overSidebar.dataTransfer.dropEffect, 'none', 'no drop effect is claimed over the sidebar')
   const dropSidebar = dropEvent(sidebarTarget)
   doc.emit('drop', dropSidebar)
   assert.equal(dropSidebar.defaultPrevented, false)
@@ -256,10 +226,9 @@ async function main() {
     assert.equal(inserted.length, 1, `payload ${JSON.stringify(payload)} must not insert`)
   }
 
-  // ── a drag that ends is over: no drop may follow it ──
+  // ── a drag that ended is over: no drop may follow it ──
   doc.emit('dragstart', dragStartEvent('session-a'))
   doc.emit('dragend', { target: chatTarget })
-  assert.equal(doc.getElementById(HINT_ID), null)
   doc.emit('drop', dropEvent(chatTarget))
   assert.equal(inserted.length, 1, 'drop after dragend must be inert')
 
@@ -268,6 +237,16 @@ async function main() {
   doc.emit('drop', dropEvent(chatTarget))
   assert.deepEqual(notices, [{ level: 'info', text: 'dshDrag.info.self' }])
   assert.equal(inserted.length, 1)
+
+  // ── a refused insertion surfaces a notice instead of failing silently ──
+  {
+    const refused = boot({ refuseInsert: true })
+    plugin.apply(refused.ctx)
+    refused.doc.emit('dragstart', dragStartEvent('session-a'))
+    refused.doc.emit('drop', dropEvent(chatTarget))
+    assert.equal(refused.inserted.length, 1, 'the insertion is attempted')
+    assert.deepEqual(refused.notices, [{ level: 'error', text: 'dshDrag.error.insert' }])
+  }
 
   // ── with no composer on stage the drop is a no-op, not a crash ──
   {
@@ -279,10 +258,9 @@ async function main() {
     assert.deepEqual(blank.notices, [])
   }
 
-  // ── disposal takes the listeners and the hint with it ──
+  // ── disposal takes the listeners with it ──
   for (const dispose of disposers) dispose()
   assert.equal(doc.count(), 0, 'disposal must remove every document listener')
-  assert.equal(doc.getElementById(HINT_ID), null)
 
   console.log(`dsh-drag apply() wiring: passed (${BUNDLE})`)
 }

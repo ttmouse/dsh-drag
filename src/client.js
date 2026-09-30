@@ -1,43 +1,43 @@
 /**
  * dsh-drag — browser half.
  *
- * Drag a conversation row from the sidebar's session list into the chat
- * transcript area: a floating hint follows the pointer and, on drop, the
- * session reference (`@[label](dsh-session:…)` mention) is inserted into the
- * target session's composer draft as a reference chip.
+ * Drag a conversation row out of the sidebar's session list and drop it over
+ * the chat area: the session reference (`@[label](dsh-session:…)` mention) is
+ * inserted into the open composer's draft as a reference chip.
  *
- * Why this shape:
+ * Feedback is the browser's own: the native drag image of the row follows the
+ * pointer and the accepted drop area shows the `copy` cursor badge. This plugin
+ * deliberately draws no overlay — an earlier revision added a floating label of
+ * its own, which just doubled the row's title next to the cursor.
+ *
+ * Why this shape (verified against the 0.1.5-rc.2 bundles):
  * - The sidebar rows are native HTML5 drag sources already: ui-workspace's
- *   SessionNodeItem puts the raw session id on the payload
- *   (`dataTransfer.setData('text/plain', node.id)`, verified in 0.1.5-rc.2).
- * - The drop side is this plugin's document-level dragover/drop pair. Dropping
- *   back onto the sidebar (any `[data-row-key]` target) is deliberately NOT
- *   prevented so the official reorder behavior keeps working.
- * - The insertion goes through `conversation.input.for(actx).insertReference`,
- *   the same span-CAS'd chip path the composer's own pick flow uses; the span
- *   (caret + draftRev) is captured at drop time via the session scope's
- *   `inputActions.captureInsertion()`.
+ *   SessionNodeItem sets `dataTransfer.setData('text/plain', node.id)` — the
+ *   raw session id — on dragstart.
+ * - The drop side is this plugin's document-level dragover/drop pair. Anything
+ *   inside the sidebar tree (`[role="tree"]`) is left untouched so the official
+ *   row reordering keeps working.
+ * - The insertion goes through the facade the composer's own pick flow uses:
+ *   `conversation.input.for(actx).insertReference(reference, span, …)`, with the
+ *   span built from `caretSpan()` (detect coordinates) + `snapshot.draftRev`
+ *   (the input machine's CAS revision). There is no `captureInsertion()`.
+ * - The target composer is resolved at drop time from the session list's
+ *   `current` id, so this plugin needs no slot to render anything.
  *
- * Row identity: dragstart reads the `text/plain` payload — ui-workspace's
- * SessionNodeItem puts the raw session id there (a `data-row-key="session:<id>"`
- * attribute is honored as a forward-compatible alternative). Workspace rows,
- * file drags, and every other source stay inert.
+ * Row identity: the `text/plain` payload (a `data-row-key="session:<id>"`
+ * attribute is still honored for forward compatibility). Workspace rows, file
+ * drags, and every other source stay inert.
  */
 
 /** Locale namespace owned by this plugin. */
 const NS = 'dshDrag'
 
-/** Dictionary key set (the source of truth for both locales). */
-const KEYS = ['hint.reference', 'info.self', 'error.insert']
-
 const DICTIONARIES = {
   zh: {
-    'hint.reference': '松开以引用会话「{title}」',
     'info.self': '当前会话不需要引用自己',
     'error.insert': '会话引用插入失败',
   },
   en: {
-    'hint.reference': 'Drop to reference “{title}”',
     'info.self': 'The current session does not need to reference itself',
     'error.insert': 'Failed to insert the session reference',
   },
@@ -74,15 +74,16 @@ function rowKeyOf(target) {
 }
 
 /**
- * The document-level drop surface: tracks the active sidebar session drag,
- * shows a floating hint while over the chat area, and inserts the reference
- * on drop. Pure DOM + callbacks so tests can drive it without a browser.
+ * The document-level drop surface: tracks the active sidebar session drag and
+ * inserts the reference on drop, leaving every visual to the browser's own drag
+ * image and cursor badge. Pure DOM + callbacks so tests can drive it without a
+ * browser.
  * @param deps - doc, sessions, t, currentSessionId, inputActions,
- *   insertSessionReference, notify, onHint.
+ *   insertSessionReference, notify.
  * @returns disposer removing every listener.
  */
 function createDropSurface(deps) {
-  const { doc, sessions, t, currentSessionId, inputActions, insertSessionReference, notify, onHint } = deps
+  const { doc, sessions, t, currentSessionId, inputActions, insertSessionReference, notify } = deps
   /** currentSessionId may be a getter (production) or a plain id (tests). */
   const currentId = () => (typeof currentSessionId === 'function' ? currentSessionId() : currentSessionId)
 
@@ -90,8 +91,6 @@ function createDropSurface(deps) {
   let dragging = null
   /** A drag that ended can never drop (dragend always precedes a later drop). */
   let ended = true
-
-  const hideHint = () => { onHint(null) }
 
   const onDragStart = (event) => {
     // Every dragstart opens a fresh gesture: a previous drag whose `dragend`
@@ -128,20 +127,17 @@ function createDropSurface(deps) {
   const onDragOver = (event) => {
     if (dragging === null || ended) return
     // The sidebar keeps its own reorder handling: never touch those events.
-    if (overSidebar(event)) {
-      hideHint()
-      return
-    }
+    if (overSidebar(event)) return
+    // Accepting the drop is the whole signal: the pointer picks up the copy
+    // badge, which is the only feedback this plugin adds.
     event.preventDefault()
     if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
-    onHint({ text: t('hint.reference', { title: dragging.title }), x: event.clientX + 14, y: event.clientY + 18 })
   }
 
   const onDrop = (event) => {
     if (dragging === null || ended) return
     if (overSidebar(event)) return
     event.preventDefault()
-    hideHint()
     const { sessionId, title } = dragging
     ended = true
     dragging = null
@@ -164,7 +160,6 @@ function createDropSurface(deps) {
   const onDragEnd = () => {
     ended = true
     dragging = null
-    hideHint()
   }
 
   doc.addEventListener('dragstart', onDragStart)
@@ -180,36 +175,10 @@ function createDropSurface(deps) {
   }
 }
 
-/** The floating hint element; one instance, repositioned per dragover. */
-function mountHint(value) {
-  let el = document.getElementById('dsh-drag-hint')
-  if (value === null) {
-    el?.remove()
-    return
-  }
-  if (el === null) {
-    el = document.createElement('div')
-    el.id = 'dsh-drag-hint'
-    el.setAttribute('data-dsh-drag-hint', '')
-    el.style.cssText = [
-      'position:fixed', 'z-index:40', 'pointer-events:none',
-      'padding:4px 10px', 'border-radius:8px', 'font-size:12px', 'white-space:nowrap',
-      'background:var(--dsw-alias-bg-module-platform, #fff)',
-      'color:var(--dsw-alias-label-primary, #1f2329)',
-      'border:1px solid var(--dsw-alias-border-l2, #d0d3d9)',
-      'box-shadow:0 4px 12px rgba(0,0,0,.12)',
-    ].join(';')
-    document.body.appendChild(el)
-  }
-  el.textContent = value.text
-  el.style.left = `${value.x}px`
-  el.style.top = `${value.y}px`
-}
-
 /**
- * Required services (cordis fiber inject): the slot registry, the sessions
- * controller (list snapshot + scope resolution), the conversation service
- * (per-session input facade), and the locale service.
+ * Required services (cordis fiber inject): the sessions controller (list
+ * snapshot + scope resolution), the conversation service (per-session input
+ * facade), and the locale service.
  */
 const pluginInject = ['slots', 'sessions', 'conversation', 'locale']
 
@@ -248,8 +217,8 @@ function apply(ctx) {
       }
     }
 
-    // The one document-level drag surface; disposal rides the fiber.
-    // `document` resolves lazily: Node test harnesses apply() without a DOM.
+    // The one document-level drag surface; disposal rides the fiber. The inert
+    // stub keeps Node test harnesses able to apply() without a DOM.
     ctx.effect(() => createDropSurface({
       doc: typeof document === 'object' && document !== null ? document : { addEventListener() {}, removeEventListener() {}, dispatchEvent() {} },
       sessions,
@@ -258,7 +227,6 @@ function apply(ctx) {
       inputActions: { captureInsertion: () => resolveFace()?.captureInsertion() ?? { start: 0, end: 0, draftRev: 0 } },
       insertSessionReference: (reference, sp) => resolveFace()?.insertSessionReference(reference, sp) ?? false,
       notify: (level, text) => resolveFace()?.notify(level, text),
-      onHint: mountHint,
     }), 'dsh-drag: drop surface')
 
     slots.inject('conversation.input.dock', () => slots.register({

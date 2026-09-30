@@ -91,14 +91,9 @@ function hostMention(sessionId, label) {
   return `@[${escaped}](dsh-session:${Buffer.from(JSON.stringify(sessionId), 'utf8').toString('base64url')})`
 }
 
-/** Hints the surface actually showed (every drop also clears with a null). */
-function shownHints(calls) {
-  return calls.hints.filter(hint => hint !== null)
-}
-
 /** Drive one whole gesture and report what the surface did. */
 function gesture({ bundle, rows, currentSessionId = 'session-current' }) {
-  const calls = { inserts: [], notices: [], hints: [] }
+  const calls = { inserts: [], notices: [] }
   const doc = fakeDoc()
   const dispose = bundle.__internals.createDropSurface({
     doc,
@@ -108,7 +103,6 @@ function gesture({ bundle, rows, currentSessionId = 'session-current' }) {
     inputActions: { captureInsertion: () => ({ start: 3, end: 3, draftRev: 7 }) },
     insertSessionReference: (reference, span) => { calls.inserts.push({ reference, span }); return true },
     notify: (level, text) => { calls.notices.push({ level, text }) },
-    onHint: (hint) => { calls.hints.push(hint) },
   })
   return { doc, dispose, calls }
 }
@@ -144,12 +138,10 @@ async function main() {
     run.doc.emit('dragover', over)
     assert.equal(over.defaultPrevented, true, 'dragover over the chat area must allow the drop')
     assert.equal(over.dataTransfer.dropEffect, 'copy')
-    assert.deepEqual(run.calls.hints.at(-1), { text: 'hint.reference(A 会话)', x: 514, y: 318 })
 
     const drop = dropEvent(plainTarget())
     run.doc.emit('drop', drop)
     assert.equal(drop.defaultPrevented, true)
-    assert.equal(run.calls.hints.at(-1), null)
     assert.equal(run.calls.notices.length, 0)
     assert.deepEqual(run.calls.inserts, [{
       reference: {
@@ -174,7 +166,6 @@ async function main() {
     const over = dragOverEvent(rowTarget('session:session-a'))
     run.doc.emit('dragover', over)
     assert.equal(over.defaultPrevented, false, 'the sidebar keeps its own dragover handling')
-    assert.equal(shownHints(run.calls).length, 0, 'no chat-area hint over the sidebar')
     const drop = dropEvent(rowTarget('session:session-a'))
     run.doc.emit('drop', drop)
     assert.equal(drop.defaultPrevented, false)
@@ -190,14 +181,12 @@ async function main() {
     workspace.doc.emit('dragover', dragOverEvent(plainTarget()))
     workspace.doc.emit('drop', dropEvent(plainTarget()))
     assert.equal(workspace.calls.inserts.length, 0)
-    assert.equal(shownHints(workspace.calls).length, 0)
     workspace.dispose()
 
     const unknown = gesture({ bundle, rows: {} })
     unknown.doc.emit('dragstart', dragStartEvent(rowTarget('session:session-gone')))
     unknown.doc.emit('drop', dropEvent(plainTarget()))
     assert.equal(unknown.calls.inserts.length, 0)
-    assert.equal(shownHints(unknown.calls).length, 0)
     unknown.dispose()
 
     const textless = gesture({ bundle, rows })
@@ -206,15 +195,13 @@ async function main() {
     textless.dispose()
   }
 
-  // ── a gesture that ends without dropping clears the hint ──
+  // ── a gesture that ends without dropping is over ──
   {
     const rows = { 'session-a': { displayTitle: 'A 会话' } }
     const run = gesture({ bundle, rows })
     run.doc.emit('dragstart', dragStartEvent(rowTarget('session:session-a')))
     run.doc.emit('dragover', dragOverEvent(plainTarget()))
-    assert.notEqual(run.calls.hints.at(-1), null)
     run.doc.emit('dragend', { target: rowTarget('session:session-a') })
-    assert.equal(run.calls.hints.at(-1), null)
     run.doc.emit('drop', dropEvent(plainTarget()))
     assert.equal(run.calls.inserts.length, 0, 'no drop may follow a dragend')
     run.dispose()
@@ -244,7 +231,6 @@ async function main() {
       inputActions: { captureInsertion: () => ({ start: 0, end: 0, draftRev: 1 }) },
       insertSessionReference: () => false,
       notify: (level, text) => { notices.push({ level, text }) },
-      onHint: () => {},
     })
     doc.emit('dragstart', dragStartEvent(rowTarget('session:session-a')))
     doc.emit('drop', dropEvent(plainTarget()))

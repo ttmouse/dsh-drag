@@ -12,18 +12,22 @@
 - 放下走的是编辑器自己的引用通道：`conversation.input.for(actx).insertReference`
   —— 与输入框内 `@`/`/` 挑选流程同一条 span-CAS 路径，插进去的是真正的 chip
   节点，而不是一段文本。
-- 拖回侧边栏（`[data-row-key]` 目标）**永远不拦截**：官方的行内重排序行为原样
-  保留。
+- 拖回侧边栏（`[role="tree"]` 里的任何行）**永远不拦截**：官方的行内重排序行为
+  原样保留。
 
 ## 行为
 
-- 按住一个会话行开始拖动，指针进入聊天区域时浮出「松开以引用会话『标题』」提示；
-- 在记录区域内松开 → 引用 chip 插入草稿（span 取自投放瞬间的
-  `inputActions.captureInsertion()`）；
+- 按住一个会话行开始拖动，指针进入聊天区域 → 接受投放（光标出现"复制"角标）；
+- 在记录区域内松开 → 引用 chip 插入草稿（span 取自投放瞬间的 `caretSpan()`
+  + `snapshot.draftRev`）；
 - 松开在侧边栏 → 什么都不发生（官方拖拽继续接管）；工作区分组行、文件、纯文本
   等其它拖拽源一律不激活；
 - 拖放当前会话自己 → 提示「当前会话不需要引用自己」；插入被拒绝（相位/版本
   不匹配）→ 提示「会话引用插入失败」。
+
+**不画任何自己的浮层**：拖动时的视觉反馈只有浏览器原生的拖影（跟随鼠标的会话行
+副本）和上面那个复制角标。早期版本额外弹了一个「松开以引用会话『标题』」气泡，
+结果就是光标旁边出现两条标题，纯噪音，已删除。
 
 ## 安装
 
@@ -55,8 +59,9 @@ pnpm test    # test/smoke.mjs + test/apply-wiring.mjs + scripts/interaction.mjs
 - `test/smoke.mjs`：假 doc 手势驱动 `createDropSurface` 全部分支（mention 编码
   对齐宿主 `dsh-session-reference` 的规范形、侧边栏放行、dragend 之后 drop 失效、
   自引用提示、插入拒绝提示、apply() 的 dock 槽与 inject 面、bundle 形状）。
-- `scripts/interaction.mjs`：jsdom + 真实 DragEvent 渲染真实 loader bundle，
-  验证提示元素的真实 DOM 生命周期与 chip 插入链路。
+- `scripts/interaction.mjs`：jsdom + 真实冒泡事件渲染真实 loader bundle，**只调
+  `apply(ctx)`**，在真实 DOM（侧边栏树 + 聊天区）上跑完整手势，并断言插件没有往
+  文档里插任何节点（自定义浮层回归会直接红）。
 
 改完 `pnpm build` 不需要重启 `dsh web`：bundle 路由按内容哈希取当前字节，
 浏览器硬刷新即可拿到新版本。

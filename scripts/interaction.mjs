@@ -1,10 +1,12 @@
 // jsdom interaction test for the browser half of dsh-drag.
 //
-// Complements test/smoke.mjs (fake-doc gestures): this one renders the real
-// shipped loader bundle into jsdom with real DragEvents, a real DOM, and the
-// real conversation.input facade shape — proving the hint element paints,
-// follows the pointer, clears on drop/dragend, and that the chip insertion
-// rides conversation.input.for(actx).insertReference with a captured span.
+// Renders the real shipped loader bundle into jsdom, calls the plugin body the
+// way the shell does — `plugin.apply(ctx)` and nothing else — and drives real
+// bubbling events at real DOM nodes: a session row inside the sidebar tree and
+// the chat area beside it. It proves the chip insertion rides
+// conversation.input.for(actx).insertReference with the caret span, that the
+// sidebar keeps its own handling, and that this plugin adds no DOM of its own
+// (the browser's drag image and copy cursor are the entire feedback).
 //
 // Run: node scripts/interaction.mjs
 import { readFileSync } from 'node:fs'
@@ -15,42 +17,50 @@ import { JSDOM } from 'jsdom'
 const here = dirname(fileURLToPath(import.meta.url))
 const root = join(here, '..')
 
-const dom = new JSDOM('<!doctype html><html><body><main id="chat"></main></body></html>', { url: 'https://dsh.local/' })
+const dom = new JSDOM(`<!doctype html><html><body>
+  <div role="tree" aria-label="sessions">
+    <div role="treeitem" aria-selected="true" id="row-a">A 会话</div>
+  </div>
+  <main id="chat"></main>
+</body></html>`, { url: 'https://dsh.local/' })
 globalThis.window = dom.window
 globalThis.document = dom.window.document
 globalThis.Event = dom.window.Event
-// jsdom's btoa wrapper throws from outside its vm realm; Node's native btoa
-// is byte-faithful and matches what the real browser gives the plugin.
-// (jsdom doesn't ship TextEncoder either; Node's own is the same API.)
-// The bundle registers itself through the loader; capture the definition.
+// jsdom doesn't ship TextEncoder; Node's own is the same API the browser gives
+// the plugin, and Node's native btoa is byte-faithful too.
 let capturedLoader = null
 globalThis.window.__ModuleLoader__ = { load: (definition) => { capturedLoader = definition } }
 
-const opened = []
 const inserted = []
 const notified = []
 
-const actx = { tag: 'session-a' }
+const actx = { tag: 'session-current' }
 const sessions = {
-  scope: (id) => (id === 'session-a' ? actx : undefined),
+  scope: (id) => (id === 'session-current' ? actx : undefined),
   list: {
-    getSnapshot: () => ({ byId: { 'session-a': { id: 'session-a', displayTitle: 'A 会话' } } }),
+    getSnapshot: () => ({
+      current: 'session-current',
+      byId: {
+        'session-a': { id: 'session-a', displayTitle: 'A 会话' },
+        'session-current': { id: 'session-current', displayTitle: 'Current' },
+      },
+    }),
     subscribe: () => () => {},
   },
 }
 const input = {
+  caretSpan: () => ({ start: 5, end: 5 }),
+  snapshot: { draft: '', draftRev: 11 },
   insertReference: (reference, span) => { inserted.push({ reference, span }); return true },
   notify: (level, text) => { notified.push({ level, text }) },
 }
 const registered = []
+const disposers = []
 const ctx = {
-  effect(fn) { return fn() },
+  effect(fn) { const dispose = fn(); disposers.push(dispose); return dispose },
   locale: {
     register: () => () => {},
-    bind: () => (key, params) => {
-      const template = { 'hint.reference': '松开以引用会话「{title}」', 'info.self': 'i', 'error.insert': 'e' }[key] ?? key
-      return params ? template.replace('{title}', params.title) : template
-    },
+    bind: () => (key) => key,
   },
   inject(deps, callback) {
     if (JSON.stringify(deps) !== JSON.stringify(['slots', 'sessions', 'conversation'])) {
@@ -73,71 +83,54 @@ await import(moduleUrl)
 if (capturedLoader === null) throw new Error('bundle did not call window.__ModuleLoader__.load')
 if (capturedLoader.id !== 'dsh-drag') throw new Error(`wrong loader id: ${capturedLoader.id}`)
 const plugin = capturedLoader.factory(() => { throw new Error('no externals expected') })
+
+// The whole point: apply() is what mounts the surface. Nothing else is called.
 plugin.apply(ctx)
 
 const entry = registered[0]
 if (entry === undefined) throw new Error('dock entry not registered')
 if (entry.spec.name !== 'conversation.input.dock') throw new Error(`wrong slot: ${entry.spec.name}`)
-const face = entry.spec.inject('session-a')
-if (face.targetSessionId !== 'session-a') throw new Error('inject share carries the wrong session')
+if (entry.component(entry.spec.inject('session-a')) !== null) throw new Error('dock component must render null')
 
-// The dock entry is a session-scoped marker (it renders null; the framework
-// mounts/unmounts it with the composer). The document-level surface is what
-// carries the interaction — created here with the same inject share.
-if (entry.component(face) !== null) throw new Error('dock component must render null')
+const chat = document.getElementById('chat')
+const rowA = document.getElementById('row-a')
+const bodyBefore = document.body.children.length
 
-let hint = null
-const surfaceDeps = {
-  doc: document,
-  sessions,
-  t: ctx.locale.bind('dshDrag'),
-  currentSessionId: 'session-other',
-  inputActions: { captureInsertion: () => ({ start: 5, end: 5, draftRev: 11 }) },
-  insertSessionReference: (reference, span) => input.insertReference(reference, span),
-  notify: (level, text) => input.notify(level, text),
-  onHint: (value) => {
-    hint?.remove()
-    hint = null
-    if (value !== null) {
-      hint = document.createElement('div')
-      hint.id = 'dsh-drag-hint'
-      hint.textContent = value.text
-      hint.style.left = `${value.x}px`
-      hint.style.top = `${value.y}px`
-      document.body.appendChild(hint)
-    }
-  },
-}
-const surfaceDispose = plugin.__internals.createDropSurface(surfaceDeps)
-
-function dragEvent(type, target, x, y) {
+/**
+ * A real bubbling event carrying the drag fields jsdom lacks. `defaultPrevented`
+ * is jsdom's own (the event is cancelable), so preventDefault is observable.
+ */
+function dragEvent(type, target, { payload = undefined, x = 500, y = 300 } = {}) {
   const event = new dom.window.Event(type, { bubbles: true, cancelable: true })
   Object.defineProperties(event, {
-    target: { value: target },
     clientX: { value: x },
     clientY: { value: y },
-    dataTransfer: { value: { dropEffect: 'none', setData() {} } },
+    dataTransfer: {
+      value: {
+        dropEffect: 'none',
+        effectAllowed: '',
+        getData: (kind) => (kind === 'text/plain' ? payload ?? '' : ''),
+        setData() {},
+      },
+    },
   })
-  event.preventDefault = () => { Object.defineProperty(event, 'defaultPrevented', { value: true, configurable: true }) }
+  return { event, target }
+}
+
+function fire(type, target, options) {
+  const { event } = dragEvent(type, target, options)
+  target.dispatchEvent(event)
   return event
 }
 
-const chat = document.getElementById('chat')
-const sidebarRow = { closest: (selector) => (selector === '[data-row-key]'
-  ? { getAttribute: (name) => (name === 'data-row-key' ? 'session:session-a' : null) }
-  : null) }
-const plain = { closest: () => null }
-
-// 1. dragstart on a session row arms the surface.
-document.dispatchEvent(dragEvent('dragstart', sidebarRow, 10, 10))
-// 2. Hovering the chat area shows the hint element with the localized copy.
-document.dispatchEvent(dragEvent('dragover', chat, 500, 300))
-if (hint === null || !hint.textContent.includes('A 会话')) throw new Error('hint did not render over the chat area')
-// 3. Hovering the sidebar hides it (official reorder territory).
-document.dispatchEvent(dragEvent('dragover', sidebarRow, 10, 10))
-if (hint !== null) throw new Error('hint stayed visible over the sidebar')
-// 4. Dropping over the chat area inserts the canonical mention with the captured span.
-document.dispatchEvent(dragEvent('drop', chat, 500, 300))
+// 1. apply() mounted a working surface: a full gesture lands one chip, and the
+//    mention is the host's canonical form.
+fire('dragstart', rowA, { payload: 'session-a', x: 10, y: 10 })
+const over = fire('dragover', chat)
+if (over.defaultPrevented !== true) throw new Error('dragover over the chat area must accept the drop')
+if (over.dataTransfer.dropEffect !== 'copy') throw new Error('the accepted drop must claim the copy cursor')
+const drop = fire('drop', chat)
+if (drop.defaultPrevented !== true) throw new Error('drop over the chat area must be handled')
 if (inserted.length !== 1) throw new Error(`expected one insertion, got ${inserted.length}`)
 const mention = inserted[0].reference.ref
 const expectedUri = `dsh-session:${Buffer.from(JSON.stringify('session-a')).toString('base64url')}`
@@ -146,19 +139,36 @@ if (JSON.stringify(inserted[0].span) !== JSON.stringify({ start: 5, end: 5, draf
   throw new Error(`span mismatch: ${JSON.stringify(inserted[0].span)}`)
 }
 if (inserted[0].reference.appearance !== 'session') throw new Error('appearance must be session')
-if (hint !== null) throw new Error('hint survived the drop')
+if (notified.length !== 0) throw new Error(`unexpected notices: ${JSON.stringify(notified)}`)
 
-// 5. A second drop after dragend is inert.
-document.dispatchEvent(dragEvent('dragstart', sidebarRow, 10, 10))
-document.dispatchEvent(dragEvent('dragend', sidebarRow, 10, 10))
-document.dispatchEvent(dragEvent('drop', chat, 500, 300))
+// 2. No overlay: the surface drew nothing anywhere in the document.
+if (document.body.children.length !== bodyBefore) throw new Error('the plugin must not add DOM nodes')
+if (document.querySelector('[data-dsh-drag-hint], #dsh-drag-hint') !== null) throw new Error('a hint element survived')
+
+// 3. Hovering the sidebar keeps the official reorder handling and inserts nothing.
+fire('dragstart', rowA, { payload: 'session-a', x: 10, y: 10 })
+const overSidebar = fire('dragover', rowA, { x: 10, y: 10 })
+if (overSidebar.defaultPrevented !== false) throw new Error('the sidebar keeps its own dragover handling')
+if (overSidebar.dataTransfer.dropEffect !== 'none') throw new Error('no drop effect may be claimed over the sidebar')
+const dropSidebar = fire('drop', rowA, { x: 10, y: 10 })
+if (dropSidebar.defaultPrevented !== false) throw new Error('a sidebar drop must stay official')
+if (inserted.length !== 1) throw new Error('a sidebar drop inserted a chip')
+
+// 4. A non-session payload (a workspace row key) never arms the surface.
+fire('dragstart', rowA, { payload: 'workspace:ws-1' })
+if (fire('dragover', chat).defaultPrevented !== false) throw new Error('a workspace drag must not arm the drop')
+
+// 5. A drop after dragend is inert.
+fire('dragstart', rowA, { payload: 'session-a' })
+fire('dragend', rowA, { payload: 'session-a' })
+fire('drop', chat)
 if (inserted.length !== 1) throw new Error('drop after dragend inserted again')
 
-// 6. Unmount clears the listeners: nothing further inserts.
-surfaceDispose()
-document.dispatchEvent(dragEvent('dragstart', sidebarRow, 10, 10))
-document.dispatchEvent(dragEvent('drop', chat, 500, 300))
-if (inserted.length !== 1) throw new Error('listeners survived dispose')
+// 6. Disposal clears the listeners: nothing further inserts.
+for (const dispose of disposers) if (typeof dispose === 'function') dispose()
+fire('dragstart', rowA, { payload: 'session-a' })
+if (fire('dragover', chat).defaultPrevented !== false) throw new Error('listeners survived dispose')
+fire('drop', chat)
+if (inserted.length !== 1) throw new Error('a disposed surface inserted a chip')
 
-surfaceDispose()
 console.log('dsh-drag jsdom interaction: 6/6 checks passed')
