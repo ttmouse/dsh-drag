@@ -18,9 +18,10 @@
  *   (caret + draftRev) is captured at drop time via the session scope's
  *   `inputActions.captureInsertion()`.
  *
- * Row identity: dragstart records the payload only when its target carries
- * `data-row-key="session:<sessionId>"` — workspace rows (`workspace:<id>`)
- * and every other drag source stay inert.
+ * Row identity: dragstart reads the `text/plain` payload — ui-workspace's
+ * SessionNodeItem puts the raw session id there (a `data-row-key="session:<id>"`
+ * attribute is honored as a forward-compatible alternative). Workspace rows,
+ * file drags, and every other source stay inert.
  */
 
 /** Locale namespace owned by this plugin. */
@@ -82,6 +83,8 @@ function rowKeyOf(target) {
  */
 function createDropSurface(deps) {
   const { doc, sessions, t, currentSessionId, inputActions, insertSessionReference, notify, onHint } = deps
+  /** currentSessionId may be a getter (production) or a plain id (tests). */
+  const currentId = () => (typeof currentSessionId === 'function' ? currentSessionId() : currentSessionId)
 
   /** The drag in flight: `{ sessionId, title } | null`. */
   let dragging = null
@@ -91,18 +94,30 @@ function createDropSurface(deps) {
   const hideHint = () => { onHint(null) }
 
   const onDragStart = (event) => {
+    // Identity sources, first match wins: the row's `data-row-key` attribute
+    // ("session:<id>", kept for forward compatibility) or — what the shipped
+    // 0.1.5-rc.2 rows actually set — the `text/plain` payload, which ui-
+    // workspace's SessionNodeItem fills with the raw session id.
     const rowKey = rowKeyOf(event.target)
+    const transfer = event.dataTransfer
+    const payload = typeof transfer?.getData === 'function' ? transfer.getData('text/plain') ?? '' : ''
     const sessionId = rowKey !== null && rowKey.startsWith('session:')
       ? rowKey.slice('session:'.length)
-      : null
-    if (sessionId === null || !isPlausibleSessionId(sessionId)) return
+      : payload
+    if (!isPlausibleSessionId(sessionId)) return
     const summary = sessions.list.getSnapshot().byId[sessionId]
     if (!summary) return
     dragging = { sessionId, title: summary.displayTitle ?? summary.title ?? sessionId }
     ended = false
   }
 
-  const overSidebar = (event) => rowKeyOf(event.target) !== null
+  /** The sidebar region: any row the shell owns. Real rows carry no
+   *  data-row-key, so the drag source element itself is the marker. */
+  const overSidebar = (event) => {
+    if (rowKeyOf(event.target) !== null) return true
+    const closest = event.target?.closest
+    return typeof closest === 'function' && event.target.closest('[role="tree"]') !== null
+  }
 
   const onDragOver = (event) => {
     if (dragging === null || ended) return
@@ -124,7 +139,7 @@ function createDropSurface(deps) {
     const { sessionId, title } = dragging
     ended = true
     dragging = null
-    if (sessionId === currentSessionId) {
+    if (sessionId === currentId()) {
       notify('info', t('info.self'))
       return
     }
@@ -159,6 +174,32 @@ function createDropSurface(deps) {
   }
 }
 
+/** The floating hint element; one instance, repositioned per dragover. */
+function mountHint(value) {
+  let el = document.getElementById('dsh-drag-hint')
+  if (value === null) {
+    el?.remove()
+    return
+  }
+  if (el === null) {
+    el = document.createElement('div')
+    el.id = 'dsh-drag-hint'
+    el.setAttribute('data-dsh-drag-hint', '')
+    el.style.cssText = [
+      'position:fixed', 'z-index:40', 'pointer-events:none',
+      'padding:4px 10px', 'border-radius:8px', 'font-size:12px', 'white-space:nowrap',
+      'background:var(--dsw-alias-bg-module-platform, #fff)',
+      'color:var(--dsw-alias-label-primary, #1f2329)',
+      'border:1px solid var(--dsw-alias-border-l2, #d0d3d9)',
+      'box-shadow:0 4px 12px rgba(0,0,0,.12)',
+    ].join(';')
+    document.body.appendChild(el)
+  }
+  el.textContent = value.text
+  el.style.left = `${value.x}px`
+  el.style.top = `${value.y}px`
+}
+
 /**
  * Required services (cordis fiber inject): the slot registry, the sessions
  * controller (list snapshot + scope resolution), the conversation service
@@ -177,6 +218,42 @@ function apply(ctx) {
 
   ctx.inject(['slots', 'sessions', 'conversation'], (scope) => {
     const { slots, sessions, conversation } = scope
+
+    /** Insertion face resolved at drop time against the CURRENT session: the
+     *  composer the user is looking at is the one the chip must land in. */
+    const resolveFace = () => {
+      const current = sessions.list.getSnapshot().current
+      if (current === undefined) return null
+      const actx = sessions.scope(current)
+      if (actx === undefined) return null
+      const input = conversation.input.for(actx)
+      const span = () => {
+        // The shell facade answers the live caret (detect coordinates) and the
+        // hot InputState (draftRev for the span CAS). A collapsed span at the
+        // caret is what insertReference replaces with the chip.
+        const caret = typeof input.caretSpan === 'function' ? input.caretSpan() : { start: 0, end: 0 }
+        const rev = (input.snapshot ?? input.state?.getSnapshot())?.draftRev ?? 0
+        return { start: caret.start, end: caret.end, draftRev: rev }
+      }
+      return {
+        insertSessionReference: (reference, sp) => input.insertReference(reference, sp),
+        notify: (level, text) => input.notify(level, text),
+        captureInsertion: span,
+      }
+    }
+
+    // The one document-level drag surface; disposal rides the fiber.
+    // `document` resolves lazily: Node test harnesses apply() without a DOM.
+    ctx.effect(() => createDropSurface({
+      doc: typeof document === 'object' && document !== null ? document : { addEventListener() {}, removeEventListener() {}, dispatchEvent() {} },
+      sessions,
+      t,
+      currentSessionId: () => sessions.list.getSnapshot().current,
+      inputActions: { captureInsertion: () => resolveFace()?.captureInsertion() ?? { start: 0, end: 0, draftRev: 0 } },
+      insertSessionReference: (reference, sp) => resolveFace()?.insertSessionReference(reference, sp) ?? false,
+      notify: (level, text) => resolveFace()?.notify(level, text),
+      onHint: mountHint,
+    }), 'dsh-drag: drop surface')
 
     slots.inject('conversation.input.dock', () => slots.register({
       name: 'conversation.input.dock',
