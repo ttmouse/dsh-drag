@@ -1,6 +1,6 @@
 {
   "name": "dsh-drag",
-  "description": "Drag a conversation from the dsh web sidebar's session list into the transcript area to open it: a shell.overlay drop zone follows the pointer while a native row drag is in flight, and dropping calls sessions.open(sessionId).",
+  "description": "Drag a conversation out of the dsh web sidebar's session list and drop it over the chat area to insert it into the composer draft as a session-reference chip (@[title](dsh-session:…)).",
   "version": "0.1.0",
   "type": "module",
   "license": "MIT",
@@ -27,7 +27,7 @@
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node test/smoke.mjs && node scripts/interaction.mjs"
+    "test": "node test/smoke.mjs && node test/apply-wiring.mjs && node scripts/interaction.mjs"
   },
   "dsh": {
     "bundle": {

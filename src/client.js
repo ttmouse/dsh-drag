@@ -94,6 +94,12 @@ function createDropSurface(deps) {
   const hideHint = () => { onHint(null) }
 
   const onDragStart = (event) => {
+    // Every dragstart opens a fresh gesture: a previous drag whose `dragend`
+    // never reached the document — the sidebar source row unmounts mid-reorder,
+    // and a detached node's events stop bubbling — must not leave the surface
+    // armed, or the next drag of anything would insert a chip.
+    dragging = null
+    ended = true
     // Identity sources, first match wins: the row's `data-row-key` attribute
     // ("session:<id>", kept for forward compatibility) or — what the shipped
     // 0.1.5-rc.2 rows actually set — the `text/plain` payload, which ui-
