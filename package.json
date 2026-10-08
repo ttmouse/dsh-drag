@@ -1,7 +1,7 @@
 {
   "name": "dsh-drag",
   "description": "Drag a conversation out of the dsh web sidebar's session list and drop it over the chat area to insert it into the composer draft as a session-reference chip (@[title](dsh-session:…)).",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -25,6 +25,10 @@
     "url": "git+https://github.com/ttmouse/dsh-drag.git"
   },
   "homepage": "https://github.com/ttmouse/dsh-drag",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.1.5-rc.2 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0"
+  },
   "files": [
     "lib/",
     "cordis.patch.yml",
@@ -33,9 +37,10 @@
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node test/smoke.mjs && node test/apply-wiring.mjs && node scripts/interaction.mjs"
+    "test": "node test/smoke.mjs && node test/apply-wiring.mjs && node test/session-resolution.mjs && node scripts/interaction.mjs"
   },
   "dsh": {
+    "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
     },

@@ -22,8 +22,13 @@
  *   `conversation.input.for(actx).insertReference(reference, span, …)`, with the
  *   span built from `caretSpan()` (detect coordinates) + `snapshot.draftRev`
  *   (the input machine's CAS revision). There is no `captureInsertion()`.
- * - The target composer is resolved at drop time from the session list's
- *   `current` id, so this plugin needs no slot to render anything.
+ * - The target composer is resolved at drop time from the Session the main view
+ *   is showing, so this plugin needs no slot to render anything. 0.2.0-rc.2
+ *   removed `SessionListState.current` (the state is now
+ *   `{ ids, byId, phase, projectionsBySession }`) — reading it is what silently
+ *   broke the drop — so the id comes from the shell's own derivation instead:
+ *   the row the main view retains. Hosts that still publish `current` keep
+ *   working through the fallback.
  *
  * Row identity: the `text/plain` payload (a `data-row-key="session:<id>"`
  * attribute is still honored for forward compatibility). Workspace rows, file
@@ -65,6 +70,32 @@ function formatSessionMention(sessionId, label) {
 /** True when the payload is a bare session id (what sidebar rows put there). */
 function isPlausibleSessionId(text) {
   return typeof text === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(text)
+}
+
+/**
+ * The id of the Session the main view is showing — the composer a drop has to
+ * land in.
+ *
+ * Two host shapes are live. Hosts up to 0.1.5-rc.x published the id on the list
+ * snapshot as `current`. From 0.2.0-rc.2 on, `SessionListState` is only
+ * `{ ids, byId, phase, projectionsBySession }`, and the shell derives the same
+ * value from ownership: the row with a positive `retainedBy.mainView` count is
+ * the one in the main pane (ui-layout, ui-cordis, ui-open-in-app,
+ * ui-settings-general, ui-workspace's `mainSessionId` and ui-session's `isMain`
+ * all use exactly this predicate). Both shapes are read here, so one build
+ * serves both hosts.
+ * @param list - `sessions.list.getSnapshot()`.
+ * @returns the session id, or undefined when no composer is on stage.
+ */
+function currentSessionIdOf(list) {
+  if (list === undefined || list === null) return undefined
+  const published = list.current
+  if (published !== undefined && published !== null) return published
+  const rows = list.byId ?? {}
+  for (const id of Object.keys(rows)) {
+    if ((rows[id]?.retainedBy?.mainView ?? 0) > 0) return id
+  }
+  return undefined
 }
 
 /** Read `data-row-key` off the event target's ancestor row, if any. */
@@ -123,9 +154,22 @@ function createDropSurface(deps) {
     if (transfer) transfer.effectAllowed = 'copyMove'
   }
 
-  /** The sidebar region: any row the shell owns. Real rows carry no
-   *  data-row-key, so the drag source element itself is the marker. */
+  /** True inside the chat column the shell wraps around transcript + composer.
+   *  That column is the one region a drop always belongs to, whatever subtree
+   *  the pointer happens to be over. */
+  const inConversation = (event) => {
+    const closest = event.target?.closest
+    return typeof closest === 'function' && event.target.closest('[data-conversation-content]') !== null
+  }
+
+  /** The sidebar region: any row the shell owns, or a tree that is not the chat
+   *  column. Real sidebar rows carry `data-row-key`; the tree check is the
+   *  fallback for the list chrome around them. */
   const overSidebar = (event) => {
+    // Chat column first: the trajectory view mounts its own JSON tree
+    // (`role="tree"`) inside `conversation.view`, and reading that as the
+    // sidebar would refuse a drop in the middle of the chat area.
+    if (inConversation(event)) return false
     if (rowKeyOf(event.target) !== null) return true
     const closest = event.target?.closest
     return typeof closest === 'function' && event.target.closest('[role="tree"]') !== null
@@ -218,7 +262,7 @@ function apply(ctx) {
      *  `conversation.input.for` throws for a session that resolves no binding. */
     const resolveFace = () => {
       try {
-        const current = sessions.list.getSnapshot().current
+        const current = currentSessionIdOf(sessions.list.getSnapshot())
         if (current === undefined) return null
         const actx = sessions.scope(current)
         if (actx === undefined) return null
@@ -252,9 +296,20 @@ function apply(ctx) {
       doc: typeof document === 'object' && document !== null ? document : { addEventListener() {}, removeEventListener() {}, dispatchEvent() {} },
       sessions,
       t,
-      currentSessionId: () => sessions.list.getSnapshot().current,
+      currentSessionId: () => currentSessionIdOf(sessions.list.getSnapshot()),
       inputActions: { captureInsertion: () => resolveFace()?.captureInsertion() ?? { start: 0, end: 0, draftRev: 0 } },
-      insertSessionReference: (reference, sp) => resolveFace()?.insertSessionReference(reference, sp) ?? false,
+      insertSessionReference: (reference, sp) => {
+        // A face that resolves to null is this plugin's own failure, not the
+        // host refusing an edit: without this line the drop is a silent no-op
+        // and a host contract drift stays invisible for a whole release (the
+        // 0.2.0 `SessionListState.current` removal hid exactly here).
+        const face = resolveFace()
+        if (face === null) {
+          console.warn('[dsh-drag] drop ignored: no Session composer to insert into (is a Session shown in the main view?)')
+          return false
+        }
+        return face.insertSessionReference(reference, sp)
+      },
       notify: (level, text) => resolveFace()?.notify(level, text),
     }), 'dsh-drag: drop surface')
 
